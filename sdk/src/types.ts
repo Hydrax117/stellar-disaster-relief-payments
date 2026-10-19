@@ -5,12 +5,17 @@ export interface BeneficiaryProfile {
   location: string;
   registrationDate: number;
   lastVerified: number;
+  /** Reference to the canonical identity (Some if identity created, None if not yet) */
+  identityHash: string | null;
+  /** Only operational factors for spending/transfers (not full identity factors) */
   verificationFactors: VerificationFactor[];
-  walletAddress: string;
   isActive: boolean;
   familySize: number;
   specialNeeds: string[];
+  /** @deprecated Use identity.trustScore via getIdentity(identityHash) */
   trustScore: number;
+  /** @deprecated Use identity.walletAddress via getIdentity(identityHash) */
+  walletAddress: string;
 }
 
 export interface VerificationFactor {
@@ -343,6 +348,16 @@ export interface BeneficiaryIdentity {
   duressPinHash?: string; // Fake PIN for safety
   geofenceZones: GeofenceZone[];
   temporaryCredentials: TemporaryCredential[];
+  /** Associated disbursement IDs for audit trail */
+  disbursementIds: string[];
+  /** Associated transfer IDs for audit trail */
+  transferIds: string[];
+}
+
+/** Complete beneficiary view combining profile + identity (single source of truth) */
+export interface BeneficiaryComplete {
+  profile: BeneficiaryProfile;
+  identity: BeneficiaryIdentity | null;
 }
 
 export interface IdentityFactor {
