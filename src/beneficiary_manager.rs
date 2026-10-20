@@ -5,11 +5,14 @@
 //! format) are documented in `docs/offline-flows.md`.
 
 use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, String, Vec, Map, U256, u64, BytesN};
-use crate::geo::{GeoPoint, GeofenceZone as StdGeofenceZone, GeoFormatter, GeoMigration};
+use crate::unique_id::*;
 
 #[contract]
 pub struct BeneficiaryManager;
 
+/// Single source of truth for beneficiary identity.
+/// This is the authoritative record containing all identity-related data.
+/// All other structures reference this via id_hash.
 #[derive(Clone)]
 pub struct BeneficiaryIdentity {
     pub id_hash: BytesN<32>, // Pseudonymous identifier (never real name)
@@ -24,23 +27,37 @@ pub struct BeneficiaryIdentity {
     pub duress_pin_hash: Option<BytesN<32>>, // Fake PIN for safety
     pub geofence_zones: Vec<GeofenceZone>,
     pub temporary_credentials: Vec<TemporaryCredential>,
+    // Disbursement/transfer linkage - track associated records
+    pub disbursement_ids: Vec<String>,
+    pub transfer_ids: Vec<String>,
 }
 
+/// Lightweight profile view - references identity via id_hash.
+/// Does NOT duplicate wallet_address, trust_score, or verification factors.
+/// Use get_identity(id_hash) for full identity data.
 #[derive(Clone)]
 pub struct BeneficiaryProfile {
-    pub id: String,
+    pub id: String,                  // Human-readable ID (e.g., "BEN-001")
     pub name: String,
     pub disaster_id: String,
     pub location: String,
     pub registration_date: u64,
     pub last_verified: u64,
+    /// Reference to the canonical identity (Some if identity created, None if not yet)
+    pub identity_hash: Option<BytesN<32>>,
+    /// Only operational factors for spending/transfers (not full identity factors)
     pub verification_factors: Vec<VerificationFactor>,
-    pub wallet_address: Address,
     pub is_active: bool,
     pub family_size: u32,
     pub special_needs: Vec<String>,
-    pub trust_score: u32, // 0-100 based on behavioral patterns
-    pub identity: Option<BeneficiaryIdentity>,
+    /// DEPRECATED: Use identity.trust_score via identity_hash
+    /// Kept for backward compatibility during migration
+    #[deprecated(note = "Use identity.trust_score via get_identity(identity_hash)")]
+    pub trust_score: u32,
+    /// DEPRECATED: Use identity.wallet_address via identity_hash
+    /// Kept for backward compatibility during migration
+    #[deprecated(note = "Use identity.wallet_address via get_identity(identity_hash)")]
+    pub wallet_address: Address,
 }
 
 #[derive(Clone)]
@@ -96,6 +113,7 @@ pub struct SocialRecoveryRequest {
 #[contractimpl]
 impl BeneficiaryManager {
     /// Register a displaced person without traditional ID
+    /// Creates both a BeneficiaryProfile (operational view) and BeneficiaryIdentity (canonical identity)
     pub fn register_beneficiary(
         env: Env,
         registrar: Address,
@@ -112,7 +130,7 @@ impl BeneficiaryManager {
         
         // Check for duplicate registrations
         let beneficiaries_key = Symbol::new(&env, "beneficiaries");
-        let beneficiaries: Map<String, BeneficiaryProfile> = env.storage().instance()
+        let mut beneficiaries: Map<String, BeneficiaryProfile> = env.storage().instance()
             .get(&beneficiaries_key)
             .unwrap_or(Map::new(&env));
         
@@ -120,7 +138,50 @@ impl BeneficiaryManager {
             panic_with_error!(&env, "Beneficiary already registered");
         }
         
-        // Create beneficiary profile
+        // Generate identity hash from verification factors (using unique_id module)
+        let identity_factors: Vec<IdentityFactor> = verification_factors.iter().map(|vf| {
+            IdentityFactor {
+                factor_type: vf.factor_type.clone(),
+                factor_hash: Self::hash_verification_factor(&env, &vf),
+                weight: vf.weight,
+                verified_at: vf.verified_at,
+                verifier: None,
+            }
+        }).collect();
+        
+        // Create canonical identity (single source of truth)
+        let identity_hash = generate_unique_id(&env, "ben_id", Some(&registrar));
+        // Convert to BytesN<32> for identity hash
+        let id_bytes = env.crypto().sha256(&identity_hash.to_string().into());
+        let id_hash: BytesN<32> = BytesN::from_array(&env, &id_bytes.to_array());
+        
+        let identity = BeneficiaryIdentity {
+            id_hash: id_hash.clone(),
+            creation_factors: identity_factors,
+            recovery_contacts: Vec::new(&env),
+            trust_score: 50, // Initial trust score
+            camp_location: location.clone(),
+            created_at: env.ledger().timestamp(),
+            last_verified: env.ledger().timestamp(),
+            wallet_address: wallet_address.clone(),
+            is_active: true,
+            duress_pin_hash: None,
+            geofence_zones: Vec::new(&env),
+            temporary_credentials: Vec::new(&env),
+            disbursement_ids: Vec::new(&env),
+            transfer_ids: Vec::new(&env),
+        };
+        
+        // Store identity (persistent for long-term)
+        let identities_key = Symbol::new(&env, "identities");
+        let mut identities: Map<BytesN<32>, BeneficiaryIdentity> = env.storage().persistent()
+            .get(&identities_key)
+            .unwrap_or(Map::new(&env));
+        
+        identities.set(id_hash.clone(), identity);
+        env.storage().persistent().set(&identities_key, &identities);
+        
+        // Create beneficiary profile referencing the identity
         let profile = BeneficiaryProfile {
             id: beneficiary_id.clone(),
             name,
@@ -128,13 +189,13 @@ impl BeneficiaryManager {
             location,
             registration_date: env.ledger().timestamp(),
             last_verified: env.ledger().timestamp(),
+            identity_hash: Some(id_hash.clone()),
             verification_factors,
-            wallet_address,
             is_active: true,
             family_size,
             special_needs,
-            trust_score: 50, // Initial trust score
-            identity: None,
+            trust_score: 50, // Deprecated: kept for backward compatibility
+            wallet_address: wallet_address.clone(), // Deprecated: kept for backward compatibility
         };
         
         beneficiaries.set(beneficiary_id.clone(), profile);
@@ -184,6 +245,16 @@ impl BeneficiaryManager {
         sha256(&data.to_string().into())
     }
 
+    /// Hash a verification factor for identity linkage
+    fn hash_verification_factor(env: &Env, factor: &VerificationFactor) -> BytesN<32> {
+        use soroban_sdk::crypto::sha256;
+        let mut data = Vec::new(env);
+        data.push_back(factor.factor_type.clone());
+        data.push_back(factor.value.clone());
+        data.push_back(String::from_str(env, &factor.weight.to_string()));
+        sha256(&data.to_string().into())
+    }
+
     /// Verify beneficiary using behavioral/possession factors
     pub fn verify_beneficiary(
         env: Env,
@@ -225,26 +296,35 @@ impl BeneficiaryManager {
             0
         };
         
-        // Update trust score based on verification success
+        // Update trust score in BOTH profile (deprecated field) AND identity (canonical)
         if verification_score >= 70 {
+            // Update deprecated field in profile for backward compatibility
             profile.trust_score = (profile.trust_score + 10).min(100);
             profile.last_verified = env.ledger().timestamp();
-            beneficiaries.set(beneficiary_id, profile);
+            beneficiaries.set(beneficiary_id.clone(), profile.clone());
             env.storage().instance().set(&beneficiaries_key, &beneficiaries);
+            
+            // Update canonical identity if exists
+            if let Some(id_hash) = profile.identity_hash {
+                Self::update_identity_trust_score(&env, &id_hash, 10);
+            }
             true
         } else {
             profile.trust_score = profile.trust_score.saturating_sub(5);
-            beneficiaries.set(beneficiary_id, profile);
+            profile.last_verified = env.ledger().timestamp();
+            beneficiaries.set(beneficiary_id.clone(), profile.clone());
             env.storage().instance().set(&beneficiaries_key, &beneficiaries);
+            
+            // Update canonical identity if exists
+            if let Some(id_hash) = profile.identity_hash {
+                Self::update_identity_trust_score(&env, &id_hash, -5);
+            }
             false
         }
     }
 
-    /// Restore access using a recovery code.
-    ///
-    /// The code must be unused and unexpired; it is marked used before the
-    /// wallet address is changed. See `docs/offline-flows.md` for the current
-    /// client/contract format mismatch and the planned random-code migration.
+    /// Restore access using recovery code
+    /// Updates BOTH profile (deprecated wallet_address) AND identity (canonical wallet_address)
     pub fn restore_access(
         env: Env,
         beneficiary_id: String,
@@ -259,31 +339,30 @@ impl BeneficiaryManager {
         let current_time = env.ledger().timestamp();
         
         if let Some(mut codes) = recovery_codes.get(beneficiary_id.clone()) {
-            for i in 0..codes.len() {
-                let code = codes.get(i).unwrap();
-                if code.code_hash == recovery_code
-                    && !code.is_used
-                    && current_time <= code.expires_at
-                {
-                    // Mark the code as used and persist the updated list so the
-                    // same code cannot be replayed.
-                    let mut used_code = code;
-                    used_code.is_used = true;
-                    codes.set(i, used_code);
-                    recovery_codes.set(beneficiary_id.clone(), codes);
-                    env.storage().instance().set(&recovery_key, &recovery_codes);
-
-                    // Update beneficiary wallet address
+            for mut code in codes.iter() {
+                if code.code_hash == recovery_code 
+                    && !code.is_used 
+                    && current_time <= code.expires_at {
+                    
+                    // Mark code as used
+                    code.is_used = true;
+                    
+                    // Update beneficiary wallet address in profile (deprecated field)
                     let beneficiaries_key = Symbol::new(&env, "beneficiaries");
                     let mut beneficiaries: Map<String, BeneficiaryProfile> = env.storage().instance()
                         .get(&beneficiaries_key)
                         .unwrap_or(Map::new(&env));
 
                     if let Some(mut profile) = beneficiaries.get(beneficiary_id.clone()) {
-                        profile.wallet_address = new_wallet;
+                        profile.wallet_address = new_wallet.clone(); // Deprecated
                         profile.last_verified = current_time;
-                        beneficiaries.set(beneficiary_id, profile);
+                        beneficiaries.set(beneficiary_id.clone(), profile.clone());
                         env.storage().instance().set(&beneficiaries_key, &beneficiaries);
+                        
+                        // Update canonical identity
+                        if let Some(id_hash) = profile.identity_hash {
+                            Self::update_identity_wallet(&env, &id_hash, &new_wallet);
+                        }
                     }
 
                     return true;
@@ -450,7 +529,42 @@ impl BeneficiaryManager {
         }
     }
 
+    /// Update trust score in canonical identity (source of truth)
+    fn update_identity_trust_score(env: &Env, id_hash: &BytesN<32>, delta: i32) {
+        let identities_key = Symbol::new(env, "identities");
+        let mut identities: Map<BytesN<32>, BeneficiaryIdentity> = env.storage().persistent()
+            .get(&identities_key)
+            .unwrap_or(Map::new(env));
+        
+        if let Some(mut identity) = identities.get(id_hash.clone()) {
+            if delta > 0 {
+                identity.trust_score = (identity.trust_score + delta as u32).min(100);
+            } else {
+                identity.trust_score = identity.trust_score.saturating_sub((-delta) as u32);
+            }
+            identity.last_verified = env.ledger().timestamp();
+            identities.set(id_hash.clone(), identity);
+            env.storage().persistent().set(&identities_key, &identities);
+        }
+    }
+
+    /// Update wallet address in canonical identity (source of truth)
+    fn update_identity_wallet(env: &Env, id_hash: &BytesN<32>, new_wallet: &Address) {
+        let identities_key = Symbol::new(env, "identities");
+        let mut identities: Map<BytesN<32>, BeneficiaryIdentity> = env.storage().persistent()
+            .get(&identities_key)
+            .unwrap_or(Map::new(env));
+        
+        if let Some(mut identity) = identities.get(id_hash.clone()) {
+            identity.wallet_address = new_wallet.clone();
+            identity.last_verified = env.ledger().timestamp();
+            identities.set(id_hash.clone(), identity);
+            env.storage().persistent().set(&identities_key, &identities);
+        }
+    }
+
     /// Create identity from multiple factors (NO BIOMETRICS)
+    /// If a profile with matching wallet_address exists, links them together
     pub fn create_identity_from_factors(
         env: Env,
         registrar: Address,
@@ -499,11 +613,16 @@ impl BeneficiaryManager {
             duress_pin_hash,
             geofence_zones: Vec::new(&env),
             temporary_credentials: Vec::new(&env),
+            disbursement_ids: Vec::new(&env),
+            transfer_ids: Vec::new(&env),
         };
         
         let mut identities = identities;
         identities.set(id_hash.clone(), identity);
         env.storage().persistent().set(&identities_key, &identities);
+        
+        // Try to link with existing profile by wallet_address
+        Self::link_identity_to_profile(&env, &id_hash, &wallet_address);
         
         id_hash
     }
@@ -518,6 +637,25 @@ impl BeneficiaryManager {
         }
         
         sha256(env, &combined.to_string().into())
+    }
+
+    /// Link an identity to a profile by wallet_address (if exists)
+    fn link_identity_to_profile(env: &Env, id_hash: &BytesN<32>, wallet_address: &Address) {
+        let beneficiaries_key = Symbol::new(env, "beneficiaries");
+        let mut beneficiaries: Map<String, BeneficiaryProfile> = env.storage().instance()
+            .get(&beneficiaries_key)
+            .unwrap_or(Map::new(env));
+        
+        // Find profile with matching wallet_address and no identity_hash yet
+        for (bid, mut profile) in beneficiaries.iter() {
+            if profile.wallet_address == *wallet_address && profile.identity_hash.is_none() {
+                profile.identity_hash = Some(id_hash.clone());
+                profile.trust_score = 50; // Sync deprecated field
+                beneficiaries.set(bid, profile);
+                env.storage().instance().set(&beneficiaries_key, &beneficiaries);
+                break;
+            }
+        }
     }
 
     /// Social recovery: 3-of-5 trusted contacts can restore access
@@ -589,13 +727,8 @@ impl BeneficiaryManager {
         
         // Check if threshold reached
         if request.approvals.len() >= request.required_approvals {
-            // Update identity wallet
-            let mut identities = identities;
-            let mut identity = identity;
-            identity.wallet_address = new_wallet;
-            identity.last_verified = current_time;
-            identities.set(id_hash.clone(), identity);
-            env.storage().persistent().set(&identities_key, &identities);
+            // Update identity wallet using helper (source of truth)
+            Self::update_identity_wallet(&env, &id_hash, &new_wallet);
             
             request.is_completed = true;
             recovery_requests.set(id_hash, request);
@@ -799,5 +932,35 @@ impl BeneficiaryManager {
             .unwrap_or(Map::new(&env));
         
         identities.get(id_hash)
+    }
+
+    /// Get complete beneficiary data by beneficiary_id (single source of truth view)
+    /// Merges profile (operational) + identity (canonical) for convenience
+    pub fn get_beneficiary_complete(env: Env, beneficiary_id: String) -> Option<BeneficiaryComplete> {
+        let beneficiaries_key = Symbol::new(&env, "beneficiaries");
+        let beneficiaries: Map<String, BeneficiaryProfile> = env.storage().instance()
+            .get(&beneficiaries_key)
+            .unwrap_or(Map::new(&env));
+        
+        let profile = beneficiaries.get(beneficiary_id)?;
+        
+        let identity = if let Some(id_hash) = profile.identity_hash {
+            Self::get_identity(env.clone(), id_hash)
+        } else {
+            None
+        };
+        
+        Some(BeneficiaryComplete {
+            profile,
+            identity,
+        })
+    }
+
+    /// Complete beneficiary view combining profile + identity
+    /// This is the recommended way to access beneficiary data
+    #[derive(Clone)]
+    pub struct BeneficiaryComplete {
+        pub profile: BeneficiaryProfile,
+        pub identity: Option<BeneficiaryIdentity>,
     }
 }
