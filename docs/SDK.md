@@ -1123,7 +1123,7 @@ async batchCreateTransfers(
 
 ### `createEmergencyTransfer()`
 
-Build a pre-configured emergency transfer with default spending rules (60% food, 30% medicine, 10% shelter, 7-day expiry). Does **not** submit to the network — call `createTransfer()` with the returned data.
+Build a pre-configured emergency transfer with default spending rules (60% food, 30% medicine, 10% shelter, 7-day expiry). Allocations use integer arithmetic where medicine (30%) and shelter (10%) are calculated directly, and food receives the remainder to avoid truncation loss, ensuring the category limits sum to 100% of the disbursement amount. Does **not** submit to the network — call `createTransfer()` with the returned data.
 
 ```typescript
 createEmergencyTransfer(
