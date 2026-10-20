@@ -424,7 +424,19 @@ export class TransferClient {
   }
 
   /**
-   * Create emergency transfer template
+   * Create emergency transfer template.
+   *
+   * Computes category limits using BigInt arithmetic:
+   * - Medicine: 30% (`amount * 30 / 100`)
+   * - Shelter: 10% (`amount * 10 / 100`)
+   * - Food: receives the remaining balance (`amount - medicine - shelter`, ~60%)
+   *
+   * This guarantees that default category limit allocations sum exactly to the
+   * total disbursement amount without losing units to integer division truncation.
+   *
+   * @param beneficiaryId - The recipient's beneficiary identifier.
+   * @param amount - Total transfer amount as an integer string.
+   * @param disasterType - Description of disaster for purpose labeling.
    */
   createEmergencyTransfer(
     beneficiaryId: string,
@@ -434,14 +446,25 @@ export class TransferClient {
     transferId: string;
     transfer: ConditionalTransfer;
   } {
+    const total = BigInt(amount);
+    if (total < 0n) {
+      throw new Error('Transfer amount must be non-negative');
+    }
+
     const transferId = `emergency_${beneficiaryId}_${Date.now()}`;
     const expiresAt = Date.now() + (7 * 24 * 60 * 60 * 1000); // 7 days
 
     // Default emergency spending rules
+    // Medicine (30%) and Shelter (10%) computed via integer division;
+    // Food gets the remaining balance so total category limits sum exactly to 100%.
+    const medicineLimit = (total * 30n) / 100n;
+    const shelterLimit = (total * 10n) / 100n;
+    const foodLimit = total - medicineLimit - shelterLimit;
+
     const spendingRules = [
-      this.createCategoryLimitRule('food', (BigInt(amount) * BigInt(60) / BigInt(100)).toString()),
-      this.createCategoryLimitRule('medicine', (BigInt(amount) * BigInt(30) / BigInt(100)).toString()),
-      this.createCategoryLimitRule('shelter', (BigInt(amount) * BigInt(10) / BigInt(100)).toString()),
+      this.createCategoryLimitRule('food', foodLimit.toString()),
+      this.createCategoryLimitRule('medicine', medicineLimit.toString()),
+      this.createCategoryLimitRule('shelter', shelterLimit.toString()),
       this.createTimeWindowRule(
         Date.now(),
         Date.now() + (7 * 24 * 60 * 60 * 1000)
